@@ -1,0 +1,657 @@
+.js
+1
+"use strict";
+2
+
+3
+const express = require("express");
+4
+const router = express.Router();
+5
+const { Readable } = require("stream");
+6
+
+7
+// --- CONFIGURACIÓN ---
+8
+const config = {
+9
+  name: "YouTube MP4 Download", // Nombre corregido a MP4
+10
+  icon: "ri-movie-fill",        // Icono cambiado a película/video
+11
+  route: "/youtube-mp4",        // RUTA CAMBIADA para evitar sobrescribir la anterior
+12
+  category_id: 1,
+13
+};
+14
+
+15
+// -------------------- HELPERS --------------------
+16
+function h(v = "") {
+17
+  return String(v)
+18
+    .replace(/&/g, "&amp;")
+19
+    .replace(/</g, "&lt;")
+20
+    .replace(/>/g, "&gt;")
+21
+    .replace(/"/g, "&quot;")
+22
+    .replace(/'/g, "&#039;");
+23
+}
+24
+
+25
+router.use((req, res, next) => {
+26
+  if (typeof res.error !== "function") {
+27
+    res.error = (message, code = 400) => res.status(code).json({ status: false, message });
+28
+  }
+29
+  if (typeof res.success !== "function") {
+30
+    res.success = (result) => res.json({ status: true, result });
+31
+  }
+32
+  next();
+33
+});
+34
+
+35
+function requireAuth(req, res) {
+36
+  if (!req.currentUser) return res.error("API Key requerida", 401);
+37
+  return null;
+38
+}
+39
+
+40
+function isPrivateIPv4(ip) {
+41
+  const m = String(ip).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+42
+  if (!m) return false;
+43
+  const a = m.slice(1).map((n) => Number(n));
+44
+  if (a.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
+45
+  if (a[0] === 10) return true;
+46
+  if (a[0] === 127) return true;
+47
+  if (a[0] === 192 && a[1] === 168) return true;
+48
+  if (a[0] === 172 && a[1] >= 16 && a[1] <= 31) return true;
+49
+  if (a[0] === 0) return true;
+50
+  return false;
+51
+}
+52
+
+53
+function validateRemoteUrl(src) {
+54
+  let u;
+55
+  try {
+56
+    u = new URL(src);
+57
+  } catch {
+58
+    return { ok: false, reason: "URL inválida" };
+59
+  }
+60
+  if (!["http:", "https:"].includes(u.protocol)) return { ok: false, reason: "Protocolo no permitido" };
+61
+
+62
+  const host = (u.hostname || "").toLowerCase();
+63
+  if (host === "localhost" || host.endsWith(".localhost")) return { ok: false, reason: "Host no permitido" };
+64
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && isPrivateIPv4(host)) return { ok: false, reason: "IP privada bloqueada" };
+6566
+  return { ok: true, url: u };
+67
+}
+68
+
+69
+function safeBaseFromTitle(title, def = "youtube") {
+70
+  const base = String(title || def).slice(0, 80);
+71
+  const safe = base.replace(/[^A-Za-z0-9_\-.]+/g, "_");
+72
+  return safe || def;
+73
+}
+74
+
+75
+function isYouTubeUrl(u = "") {
+76
+  u = String(u || "");
+77
+  return /^https?:\/\//i.test(u) && /(youtube\.com|youtu\.be|music\.youtube\.com)/i.test(u);
+78
+}
+79
+
+80
+// -------------------- SAVENOW SCRAPER --------------------
+81
+const videoQualities = ["144", "240", "360", "720", "1080", "1440", "4k"];
+82
+// Audio eliminado completamente
+83
+
+84
+const DEFAULT_VIDEO_QUALITY = "360";
+85
+
+86
+function getSavenowHeaders() {
+87
+  return {
+88
+    "User-Agent": "Mozilla/5.0 (Android 13; Mobile; rv:146.0) Gecko/146.0 Firefox/146.0",
+89
+    Referer: "https://y2down.cc/enSB/",
+90
+    Accept: "application/json, text/plain, */*",
+91
+  };
+92
+}
+93
+
+94
+async function fetchJsonStrict(url, headers) {
+95
+  const r = await fetch(url, { headers });
+96
+  const txt = await r.text();
+97
+
+98
+  let j = null;
+99
+  try {
+100
+    j = JSON.parse(txt);
+101
+  } catch {
+102
+    const sample = txt.slice(0, 180).replace(/\s+/g, " ").trim();
+103
+    throw new Error(`Respuesta no JSON del servidor: ${sample || "unknown"}`);
+104
+  }
+105
+
+106
+  if (!r.ok) throw new Error(`upstream_http_${r.status}`);
+107
+  return j;
+108
+}
+109
+
+110
+async function processDownload(videoUrl, type, qualityOrFormat) {
+111
+  const apiKey = process.env.SAVENOW_API_KEY || "dfcb6d76f2f6a9894gjkege8a4ab232222";
+112
+  const headers = getSavenowHeaders();
+113
+
+114
+  const format = String(qualityOrFormat || "").trim();
+115
+  if (!format) throw new Error("Formato inválido");
+116
+
+117
+  const initUrl =
+118
+    `https://p.savenow.to/ajax/download.php?copyright=0` +
+119
+    `&format=${encodeURIComponent(format)}` +
+120
+    `&url=${encodeURIComponent(videoUrl)}` +
+121
+    `&api=${encodeURIComponent(apiKey)}`;
+122
+
+123
+  const data = await fetchJsonStrict(initUrl, headers);
+124
+  if (!data || data.success !== true || !data.id) throw new Error("No se pudo iniciar la descarga");
+125
+
+126
+  const taskId = String(data.id);
+127
+  const progressUrl = `https://p.savenow.to/api/progress?id=${encodeURIComponent(taskId)}`;
+128
+
+129
+  const MAX_TRIES = 80;
+130
+  for (let i = 0; i < MAX_TRIES; i++) {
+131
+    await new Promise((r) => setTimeout(r, 2000));
+132
+    const p = await fetchJsonStrict(progressUrl, headers);
+const p = await fetchJsonStrict(progressUrl, headers);
+133
+    const progress = Number(p?.progress || 0);
+134
+
+135
+    if (progress === 1000 && p?.download_url) {
+136
+      const url = String(p.download_url);
+137
+      if (!/^https?:\/\//i.test(url)) throw new Error("download_url inválido");
+138
+      return url;
+139
+    }
+140
+  }
+141
+  throw new Error("Tiempo de espera agotado");
+142
+}
+143
+
+144
+// -------------------- 1) PROXY DE DESCARGA (VIDEO) --------------------
+145
+router.get("/dl", async (req, res) => {
+146
+  const authErr = requireAuth(req, res);
+147
+  if (authErr) return;
+148
+
+149
+  const type = String(req.query.type || "").toLowerCase();
+150
+  const src = String(req.query.src || "");
+151
+  const download = String(req.query.download || "") === "1";
+152
+  let filename = String(req.query.filename || "");
+153
+
+154
+  if (!src) return res.error("Falta src", 400);
+155
+  // Solo permitimos video
+156
+  if (type !== "video") return res.error("Solo se permite descarga de video (MP4)", 400);
+157
+
+158
+  const v = validateRemoteUrl(src);
+159
+  if (!v.ok) return res.error(`src inválido: ${v.reason}`, 400);
+160
+
+161
+  if (!filename) filename = "youtube.mp4";
+162
+  filename = filename.slice(0, 120).replace(/[^A-Za-z0-9_\-.]+/g, "_");
+163
+  if (!filename) filename = "youtube.mp4";
+164
+
+165
+  try {
+166
+    const range = req.headers.range;
+167
+    const headers = { "User-Agent": getSavenowHeaders()["User-Agent"] };
+168
+    if (range) headers["Range"] = range;
+169
+
+170
+    const upstream = await fetch(v.url.toString(), { headers });
+171
+
+172
+    res.status(upstream.status);
+173
+
+174
+    if (!upstream.ok && upstream.status !== 206) {
+175
+      return res.error(`Upstream error: ${upstream.status}`, 502);
+176
+    }
+177
+
+178
+    const ct = upstream.headers.get("content-type") || "video/mp4";
+179
+    res.setHeader("Content-Type", ct);
+180
+
+181
+    const cl = upstream.headers.get("content-length");
+182
+    if (cl) res.setHeader("Content-Length", cl);
+183
+
+184
+    const cr = upstream.headers.get("content-range");
+185
+    if (cr) res.setHeader("Content-Range", cr);
+186
+
+187
+    const ar = upstream.headers.get("accept-ranges");
+188
+    if (ar) res.setHeader("Accept-Ranges", ar);
+189
+
+190
+    if (download) {
+191
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+192
+    } else {
+193
+      res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+194
+    }
+195
+
+196
+    res.setHeader("Cache-Control", "no-store");
+197
+
+198
+    if (!upstream.body) return res.error("Upstream sin body", 502);
+199
+
+200
+    const nodeStream =
+201
+      typeof Readable.fromWeb === "function" ? Readable.fromWeb(upstream.body) : upstream.body;
+202
+
+203
+    nodeStream.on("error", () => {
+204
+      try { res.end(); } catch {}
+205
+    });
+206
+
+207
+    nodeStream.pipe(res);
+208
+  } catch (e) {
+209
+    return res.error("Error descargando: " + (e?.message || "unknown"), 500);
+210
+  }
+211
+});
+212
+213
+// -------------------- 2) RESOLVE (VIDEO ONLY) --------------------
+214
+router.post("/resolve", async (req, res) => {
+215
+  const authErr = requireAuth(req, res);
+216
+  if (authErr) return;
+217
+
+218
+  try {
+219
+    const url = String((req.body?.url || req.query?.url || "").trim());
+220
+    const type = String((req.body?.type || req.query?.type || "video")).toLowerCase();
+221
+    const quality = String((req.body?.quality || req.query?.quality || "")).trim();
+222
+
+223
+    if (!url) return res.error("Falta la URL", 400);
+224
+    if (!isYouTubeUrl(url)) return res.error("Enlace no válido", 400);
+225
+    
+226
+    // Forzamos solo video
+227
+    if (type !== "video") return res.error("Solo disponible descarga de video MP4", 400);
+228
+
+229
+    let meta = null;
+230
+    try {
+231
+      const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, {
+232
+        headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" },
+233
+      });
+234
+      if (r.ok) meta = await r.json().catch(() => null);
+235
+    } catch {}
+236
+
+237
+    const title = String(meta?.title || "YouTube");
+238
+    const authorName = String(meta?.author_name || "");
+239
+    const thumb = String(meta?.thumbnail_url || "");
+240
+
+241
+    let direct = "";
+242
+    let picked = "";
+243
+
+244
+    // Solo lógica de video
+245
+    const q = quality || DEFAULT_VIDEO_QUALITY;
+246
+    if (!videoQualities.includes(q)) return res.error("Calidad inválida", 400);
+247
+    picked = q;
+248
+    direct = await processDownload(url, "video", q);
+249
+
+250
+    const base = safeBaseFromTitle(title, "youtube");
+251
+    const filename = `${base}_${picked === "4k" ? "4k" : picked + "p"}.mp4`;
+252
+
+253
+    const dl_inline =
+254
+      `${config.route}/dl?type=video` +
+255
+      `&src=${encodeURIComponent(direct)}` +
+256
+      `&filename=${encodeURIComponent(filename)}`;
+257
+
+258
+    const dl_download = dl_inline + `&download=1`;
+259
+
+260
+    return res.success({
+261
+      title,
+262
+      author: { name: authorName, username: "" },
+263
+      thumbnail: thumb,
+264
+      request: { url, type: "video", quality: quality || "" },
+265
+      picked: { quality: picked },
+266
+      media: {
+267
+        direct,
+268
+        dl_inline,
+269
+        dl_download,
+270
+      },
+271
+    });
+272
+  } catch (e) {
+273
+    return res.error("Error interno: " + (e?.message || "unknown"), 500);
+274
+  }
+275
+});
+276
+
+277
+// -------------------- 3) OPTIONS (VIDEO ONLY) --------------------
+278
+router.post("/", async (req, res) => {
+279
+  const authErr = requireAuth(req, res);
+280
+  if (authErr) return;
+281
+
+282
+  try {
+283
+    const url = String((req.body?.url || req.query?.url || "").trim());
+284
+    if (!url) return res.error("Falta la URL", 400);
+285
+    if (!isYouTubeUrl(url)) return res.error("Enlace no válido", 400);
+286
+
+287
+    let meta = null;
+288
+    try {
+289
+      const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`, {
+290
+        headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json" },
+291
+      });
+292
+      if (r.ok) meta = await r.json().catch(() => null);
+293
+    } catch {}
+294
+
+295
+    const title = String(meta?.title || "YouTube");
+296
+    const authorName = String(meta?.author_name || "");
+297
+    const thumb = String(meta?.thumbnail_url || "");
+298
+
+299
+    const result = {
+300
+      title,
+301
+      author: { name: authorName, username: "" },
+302
+      thumbnail: thumb,
+303
+      defaults: {
+304
+        video_quality: DEFAULT_VIDEO_QUALITY,
+305
+      },
+306
+      options: {
+307
+        video: videoQualities.map((q) => ({ quality: q, label: q === "4k" ? "4K" : `${q}p` })),
+308
+      },
+309
+      source: { url },
+310
+    };
+311
+
+312
+    return res.json({ status: true, result });
+313
+  } catch (e) {
+314
+    return res.error("Error interno: " + (e?.message || "unknown"), 500);
+315
+  }
+316
+});
+317
+
+318
+// -------------------- 4) INTERFAZ (VIDEO ONLY) --------------------
+319
+router.get("/", (req, res) => {
+320
+  const user = req.session?.user;
+321
+  if (!user) return res.redirect("/login");
+322
+
+323
+  const apiKey = String(user.apikey || "");
+324
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
+325
+  const host = req.get("host");
+326
+  // Aquí usamos la nueva ruta automáticamente gracias a config.route
+327
+  const fullUrl = `${proto}://${host}${config.route}`;
+328
+
+329
+  res.type("html").send(`<!DOCTYPE html>
